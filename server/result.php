@@ -50,6 +50,18 @@ if (is_file($resultFile)) {
         $out = ['status' => $data['status'], 'id' => $id];
         if ($data['status'] === 'done') {
             $out['moments'] = is_array($data['moments'] ?? null) ? $data['moments'] : [];
+            /* Download results (download.php): pass the resolved video
+               through as well — validated, nothing else is echoed. */
+            if (isset($data['url']) && is_string($data['url'])
+                && str_starts_with($data['url'], 'https://') && strlen($data['url']) <= 2000) {
+                $out['url'] = $data['url'];
+            }
+            if (isset($data['title']) && is_string($data['title'])) {
+                $out['title'] = substr($data['title'], 0, 200);
+            }
+            if (isset($data['duration']) && is_numeric($data['duration'])) {
+                $out['duration'] = (float) $data['duration'];
+            }
         } else {
             $out['error'] = isset($data['error']) ? (string) $data['error'] : 'analysis_failed';
         }
