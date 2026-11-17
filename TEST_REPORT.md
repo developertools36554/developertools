@@ -9,7 +9,7 @@
   sha256 `3256173f…` / `f0d36ecb…`), yt-dlp.exe (23 MB, official release,
   sha256 `f5389d36…`), README.txt.
 - Source: `~/workspace/viral_clips_app/src/` — Program.cs (~35 KB, fresh own
-  code), Harness.cs, build.sh. No PeakCut code anywhere.
+  code), Harness.cs, build.sh. Totally own code.
 
 ## What was verified
 - `mcs` build clean (twice, incl. after the download-file fix). Exe is a
@@ -55,5 +55,5 @@
 - `src/Program.cs`, `src/Harness.cs`, `src/build.sh`
 - `ViralClips_v1_README.txt` (ship as README.md in the repo)
 - `.gitignore` (excludes out/, pkg/, test/, *.settings.txt, *.zip)
-- Suggested repo files: README.md, LICENSE (MIT, like PeakCut), .gitignore.
+- Suggested repo files: README.md, LICENSE (MIT), .gitignore.
 - NEVER commit `ViralClips.settings.txt` (holds the user's API key).

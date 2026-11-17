@@ -1,4 +1,4 @@
-ViralClips v1 - OWN code, written from scratch (no PeakCut code, no PeakCut dependency)
+ViralClips v1 - totally own code, written from scratch
 ================================================================================
 
 WHAT IT DOES
