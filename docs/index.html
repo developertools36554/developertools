@@ -43,7 +43,7 @@
       <input id="link-input" type="url" placeholder="https://www.youtube.com/watch?v=... or https://www.tiktok.com/@.../video/..." spellcheck="false">
     </label>
     <button id="try-link" type="button" class="btn secondary">Try link download</button>
-    <p class="muted small">Honest note: a static page cannot download YouTube or TikTok videos directly — the browser blocks it. ViralClips tries a public download service first. If that fails, upload the video file below instead — that path works fully in your browser.</p>
+    <p class="muted small">Paste a YouTube or TikTok link and press the button — our server fetches it for you (videos up to 30 minutes), then it loads in your browser. If the fetch fails, upload the video file below instead — that path works fully in your browser.</p>
 
     <div id="drop-zone" class="drop-zone" tabindex="0" role="button" aria-label="Choose a video file">
       <p><strong>Drop a video file here, or click to choose one</strong></p>
@@ -90,6 +90,7 @@
     <div class="form-row">
       <button id="make-clips" type="button" class="btn primary" disabled>Make clips</button>
       <span id="ffmpeg-state" class="small muted">Video cutter (ffmpeg.wasm) loads on demand from the CDN when you press Make clips.</span>
+      <p class="muted small">Make clips turns on after Analyse ranks your clips — add a video, press Analyse video, tick the clips you want, then press Make clips.</p>
     </div>
     <progress id="progress" value="0" max="100" hidden></progress>
     <ul id="download-list" class="download-list"></ul>
