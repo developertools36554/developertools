@@ -1,10 +1,17 @@
-// ViralClips v1 - OWN code, written from scratch. No PeakCut code, no PeakCut dependency.
+// ViralClips v2 - OWN code, written from scratch. Fully own work, no third-party clip engine.
 // Paste a YouTube / TikTok link (or pick a local file). The app downloads the video
-// with bundled yt-dlp, reads it FAST with ffprobe + ffmpeg audio analysis, scores
-// candidate moments with its own viral scoring, and cuts the best ones to 9:16
-// vertical clips with burned captions. No AI key is required; an optional key in
-// Settings can boost moment-picking. Only clip your own videos or ones you have
-// permission to use. No clip is guaranteed to go viral.
+// with bundled yt-dlp, reads it FAST with ffprobe + ffmpeg audio analysis, and cuts
+// the best moments to 9:16 vertical clips with burned captions.
+// TWO CUT MODES (pick at the top of the window):
+//   1. Full Cut - local own scoring (speech, loudness, hook words, captions).
+//      No key needed. Exactly what v1 did.
+//   2. Cut using AI - the AI brain (YOUR OWN Gemini / OpenAI / Groq key from
+//      Settings) reads the transcript + loudness data and picks the moments most
+//      likely to hold a stranger's attention. No key = clear message + Full Cut
+//      fallback. Any AI failure falls back to local scoring, and the app says so.
+// Only clip your own videos or ones you have permission to use.
+// No score can guarantee a clip will go viral - it only ranks the moments
+// most likely to hold a stranger's attention.
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -20,8 +27,8 @@ using System.Windows.Forms;
 
 [assembly: System.Reflection.AssemblyTitle("ViralClips")]
 [assembly: System.Reflection.AssemblyDescription("Turn long videos into vertical viral clips. Own code.")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("2.0.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("2.0.0.0")]
 
 namespace ViralClips
 {
@@ -353,6 +360,222 @@ namespace ViralClips
         }
     }
 
+
+    // ------------------------------------------------------------------
+    // Cut using AI - the AI brain (user's own key: Gemini / OpenAI / Groq).
+    // Own code. The AI is asked for JSON only, the reply is parsed
+    // defensively, timestamps are clamped inside the video and picks are
+    // de-overlapped. Any failure falls back to local scoring - the app
+    // always says so plainly. Never hardcode a key. No score can
+    // guarantee a clip will go viral.
+    // ------------------------------------------------------------------
+    public static class AiBrain
+    {
+        // The prompt: transcript + loudness/energy data, JSON-only reply.
+        public static string BuildPrompt(List<VttCue> cues, List<SpeechSpan> spans,
+            double duration, double clipLen, int count)
+        {
+            var sb = new StringBuilder();
+            sb.Append("You are a short-video editor. A video is ")
+              .Append(((int)Math.Round(duration))).Append(" seconds long. Below is its transcript with timestamps")
+              .Append(" and its loudness/energy data (speech % per part). Pick the moments most likely")
+              .Append(" to hold a stranger's attention and make them keep watching - a strong hook in")
+              .Append(" the first 2 seconds (a question, a shocking word, a number, a bold claim),")
+              .Append(" dense fast speech, and a clear payoff.\n");
+            var tr = new StringBuilder();
+            foreach (VttCue c in cues)
+            {
+                if (tr.Length > 12000) break;
+                tr.Append("[").Append(ViralScorer.FormatTime(c.Start).Substring(0, 8)).Append("] ")
+                  .Append(c.Text).Append(" ");
+            }
+            if (tr.Length > 20)
+                sb.Append("TRANSCRIPT:\n").Append(tr.ToString()).Append("\n");
+            else
+                sb.Append("TRANSCRIPT: none available - use the energy data only.\n");
+            int buckets = (int)Math.Min(12, Math.Max(1, Math.Ceiling(duration / 30.0)));
+            double bw = duration / buckets;
+            sb.Append("ENERGY (speech % per part): ");
+            for (int i = 0; i < buckets; i++)
+            {
+                double a = i * bw, b = Math.Min(duration, (i + 1) * bw);
+                double pct = ViralScorer.SpeechSeconds(spans, a, b) / Math.Max(1.0, (b - a)) * 100;
+                sb.Append(string.Format(CultureInfo.InvariantCulture, "{0}-{1}s {2}%, ",
+                    (int)Math.Round(a), (int)Math.Round(b), (int)Math.Round(pct)));
+            }
+            sb.Append("\n");
+            sb.Append("RULES: reply with ONLY a JSON array, no other text, no markdown. Each item must be exactly: ")
+              .Append("{\"start_sec\": <number>, \"end_sec\": <number>, \"score\": 0-100, ")
+              .Append("\"title\": \"short hook title\", \"reason\": \"one short sentence\"}. ")
+              .Append("Pick at most ").Append(count + 2).Append(" moments. start_sec must be >= 0 and end_sec <= ")
+              .Append(((int)Math.Round(duration))).Append(". A moment is at most ").Append(((int)clipLen))
+              .Append(" seconds long. Score = how likely a stranger keeps watching (100 = strongest hook).");
+            return sb.ToString();
+        }
+
+        // Pull the JSON array out of a provider reply (the array sits inside
+        // a JSON string value, so brackets are plain text in the raw body).
+        public static string ExtractJsonArray(string resp)
+        {
+            if (string.IsNullOrEmpty(resp)) return null;
+            int a = resp.IndexOf('[');
+            int b = resp.LastIndexOf(']');
+            if (a < 0 || b <= a) return null;
+            string s2 = resp.Substring(a, b - a + 1);
+            s2 = s2.Replace("\\\"", "\"").Replace("\\\\", "\\").Replace("\\n", " ").Replace("\\t", " ");
+            return s2;
+        }
+
+        private static bool TryNumber(string obj, string name, out double value)
+        {
+            value = 0;
+            Match m = Regex.Match(obj, "\"" + name + "\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
+            if (!m.Success) return false;
+            return double.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out value);
+        }
+
+        private static bool TryString(string obj, string name, out string value)
+        {
+            value = "";
+            Match m = Regex.Match(obj, "\"" + name + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+            if (!m.Success) return false;
+            value = m.Groups[1].Value.Replace("\\\"", "\"").Replace("\\\\", "\\").Replace("\\n", " ");
+            return true;
+        }
+
+        // Defensive parse: clamp/validate every timestamp inside the video,
+        // clamp scores 0-100, drop unusable items, sort best-first.
+        public static List<Clip> ParseAiMoments(string json, double duration, double clipLen)
+        {
+            var clips = new List<Clip>();
+            if (string.IsNullOrEmpty(json) || duration <= 5) return clips;
+            string arr = ExtractJsonArray(json);
+            if (arr == null) return clips;
+            foreach (Match m in Regex.Matches(arr, "\\{[^\\}]*\\}"))
+            {
+                string obj = m.Value;
+                double st, en, sc;
+                if (!TryNumber(obj, "start_sec", out st) && !TryNumber(obj, "start", out st)) continue;
+                if (!TryNumber(obj, "end_sec", out en) && !TryNumber(obj, "end", out en)) en = st + clipLen;
+                int score = TryNumber(obj, "score", out sc) ? (int)Math.Round(sc) : 70;
+                string title, reason;
+                if (!TryString(obj, "title", out title))
+                    TryString(obj, "hook", out title);
+                TryString(obj, "reason", out reason);
+                st = Math.Max(0, Math.Min(st, duration - 5));
+                en = Math.Max(st + 5, Math.Min(en, duration));
+                if (en - st > clipLen) en = st + clipLen;
+                if (en > duration) en = duration;
+                if (en - st < 5) continue;
+                if (score < 0) score = 0;
+                if (score > 100) score = 100;
+                title = ViralScorer.CleanText(title);
+                if (title.Length == 0)
+                    title = "AI moment at " + ViralScorer.FormatTime(st).Substring(0, 8);
+                if (title.Length > 70) title = title.Substring(0, 70);
+                clips.Add(new Clip
+                {
+                    Start = st,
+                    Length = en - st,
+                    Score = score,
+                    Title = title,
+                    Hook = title,
+                    Reason = "AI: " + (reason.Length > 0 ? reason : "picked by the AI brain")
+                });
+            }
+            clips.Sort(delegate(Clip a, Clip b) { return b.Score.CompareTo(a.Score); });
+            return clips;
+        }
+
+        // One AI call. Returns true + de-overlapped clips, or false + error.
+        // No key, no usable reply, or any request failure all return false -
+        // the caller falls back to Full Cut local scoring and says so.
+        public static bool CallAi(List<VttCue> cues, List<SpeechSpan> spans, double duration,
+            double clipLen, int count, out List<Clip> clips, out string error)
+        {
+            clips = null;
+            error = "";
+            AiSettings s = AiSettings.Load();
+            if (string.IsNullOrEmpty(s.ApiKey) || string.IsNullOrEmpty(s.Provider))
+            {
+                error = "no AI key set - add your key in AI Settings";
+                return false;
+            }
+            try
+            {
+                string prompt = BuildPrompt(cues, spans, duration, clipLen, count);
+                string url, body;
+                bool bearer = true;
+                if (s.Provider == "gemini")
+                {
+                    string model = string.IsNullOrEmpty(s.Model) ? "gemini-2.5-flash" : s.Model;
+                    url = "https://generativelanguage.googleapis.com/v1beta/models/" + Uri.EscapeDataString(model)
+                        + ":generateContent?key=" + Uri.EscapeDataString(s.ApiKey);
+                    body = "{\"contents\":[{\"parts\":[{\"text\":\"" + ViralScorer.EscapeJson(prompt) + "\"}]}]}";
+                    bearer = false;
+                }
+                else
+                {
+                    string model = string.IsNullOrEmpty(s.Model) ? "gpt-4o-mini" : s.Model;
+                    url = s.Provider == "groq" ? "https://api.groq.com/openai/v1/chat/completions"
+                        : "https://api.openai.com/v1/chat/completions";
+                    body = "{\"model\":\"" + ViralScorer.EscapeJson(model) + "\",\"messages\":["
+                        + "{\"role\":\"user\",\"content\":\"" + ViralScorer.EscapeJson(prompt) + "\"}]}";
+                }
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "POST";
+                req.ContentType = "application/json";
+                req.Timeout = 60000;
+                if (bearer) req.Headers["Authorization"] = "Bearer " + s.ApiKey;
+                byte[] bytes = new UTF8Encoding(false).GetBytes(body);
+                req.ContentLength = bytes.Length;
+                using (Stream st = req.GetRequestStream()) { st.Write(bytes, 0, bytes.Length); }
+                string resp;
+                using (var r = (HttpWebResponse)req.GetResponse())
+                using (var sr = new StreamReader(r.GetResponseStream()))
+                { resp = sr.ReadToEnd(); }
+                List<Clip> parsed = ParseAiMoments(resp, duration, clipLen);
+                if (parsed.Count == 0)
+                {
+                    error = "the AI returned no usable moments";
+                    return false;
+                }
+                clips = ViralScorer.PickTop(parsed, count);
+                if (clips.Count == 0)
+                {
+                    error = "the AI moments overlapped too much";
+                    return false;
+                }
+                return true;
+            }
+            catch (WebException wex)
+            {
+                string msg = wex.Message;
+                try
+                {
+                    HttpWebResponse wr = wex.Response as HttpWebResponse;
+                    if (wr != null)
+                    {
+                        using (var sr = new StreamReader(wr.GetResponseStream()))
+                        {
+                            string b = sr.ReadToEnd();
+                            if (b.Length > 200) b = b.Substring(0, 200);
+                            if (b.Length > 0) msg += " - " + b;
+                        }
+                    }
+                }
+                catch { }
+                error = "AI request failed: " + msg;
+                return false;
+            }
+            catch (Exception ex)
+            {
+                error = "AI request failed: " + ex.Message;
+                return false;
+            }
+        }
+    }
+
     // Settings file next to the exe: provider, model, api key (never hardcoded).
     public class AiSettings
     {
@@ -445,6 +668,10 @@ namespace ViralClips
         private DateTime startedAt;
         private string lastError;
         private string aiNote;
+        private RadioButton rbFullCut;
+        private RadioButton rbAiCut;
+        private Label lblMode;
+        private int cutMode; // 0 = Full Cut (local scoring), 1 = Cut using AI
 
         private string ExeDir { get { return AppDomain.CurrentDomain.BaseDirectory; } }
         private string FfmpegPath { get { return Path.Combine(ExeDir, "ffmpeg.exe"); } }
@@ -453,8 +680,8 @@ namespace ViralClips
 
         public MainForm()
         {
-            Text = "ViralClips v1 - Own AI Clips";
-            Size = new Size(660, 760);
+            Text = "ViralClips v2 - Own AI Clips";
+            Size = new Size(660, 880);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -472,10 +699,40 @@ namespace ViralClips
             lblTitle.Location = new Point(x, y); lblTitle.Size = new Size(w, 30);
             Controls.Add(lblTitle); y += 30;
             var lblSub = new Label();
-            lblSub.Text = "Paste a link, find the viral moments, cut 9:16 clips. Own code - no PeakCut.";
+            lblSub.Text = "Paste a link, find the viral moments, cut 9:16 clips. Fully own code.";
             lblSub.ForeColor = Color.DimGray;
             lblSub.Location = new Point(x, y); lblSub.Size = new Size(w, 22);
             Controls.Add(lblSub); y += 32;
+
+            // ---- Cut mode: two big clear options at the top ----
+            var grpMode = new GroupBox();
+            grpMode.Text = "How do you want to cut?";
+            grpMode.Font = new Font("Segoe UI", 11, FontStyle.Bold);
+            grpMode.Location = new Point(x, y); grpMode.Size = new Size(w, 122);
+            Controls.Add(grpMode); y += 132;
+            rbFullCut = new RadioButton();
+            rbFullCut.Text = "Full Cut - all the best moments";
+            rbFullCut.Font = new Font("Segoe UI", 11, FontStyle.Bold);
+            rbFullCut.Location = new Point(14, 24); rbFullCut.Size = new Size(560, 24);
+            rbFullCut.Checked = true;
+            rbFullCut.CheckedChanged += Mode_CheckedChanged;
+            grpMode.Controls.Add(rbFullCut);
+            var lblFullDesc = new Label();
+            lblFullDesc.Text = "Local scoring only, no key needed. Speech, loudness, hook words and captions rank every moment - like v1.";
+            lblFullDesc.ForeColor = Color.DimGray;
+            lblFullDesc.Location = new Point(34, 48); lblFullDesc.Size = new Size(550, 18);
+            grpMode.Controls.Add(lblFullDesc);
+            rbAiCut = new RadioButton();
+            rbAiCut.Text = "Cut using AI - the AI brain picks the moments";
+            rbAiCut.Font = new Font("Segoe UI", 11, FontStyle.Bold);
+            rbAiCut.Location = new Point(14, 70); rbAiCut.Size = new Size(560, 24);
+            rbAiCut.CheckedChanged += Mode_CheckedChanged;
+            grpMode.Controls.Add(rbAiCut);
+            var lblAiDesc = new Label();
+            lblAiDesc.Text = "Sends the transcript + loudness data to YOUR key (Gemini / OpenAI / Groq). Needs a key in AI Settings.";
+            lblAiDesc.ForeColor = Color.DimGray;
+            lblAiDesc.Location = new Point(34, 94); lblAiDesc.Size = new Size(550, 18);
+            grpMode.Controls.Add(lblAiDesc);
 
             AddLabel("YouTube / TikTok link:", y); y += 24;
             txtLink = new TextBox();
@@ -522,10 +779,15 @@ namespace ViralClips
             Controls.Add(btnSettings); y += 44;
 
             lblAi = new Label();
-            lblAi.Text = "AI boost: off (local scoring only).";
+            lblAi.Text = "AI key: not set.";
             lblAi.ForeColor = Color.DimGray;
             lblAi.Location = new Point(x, y); lblAi.Size = new Size(w, 22);
-            Controls.Add(lblAi); y += 30;
+            Controls.Add(lblAi); y += 24;
+            lblMode = new Label();
+            lblMode.Text = "Mode: Full Cut.";
+            lblMode.ForeColor = Color.DimGray;
+            lblMode.Location = new Point(x, y); lblMode.Size = new Size(w, 22);
+            Controls.Add(lblMode); y += 30;
 
             btnAnalyse = new Button();
             btnAnalyse.Text = "Download + Analyse";
@@ -601,10 +863,21 @@ namespace ViralClips
         private void RefreshAiLabel()
         {
             AiSettings s = AiSettings.Load();
-            if (!string.IsNullOrEmpty(s.ApiKey) && !string.IsNullOrEmpty(s.Provider))
-                lblAi.Text = "AI boost: ON (" + s.Provider + " / " + s.Model + ", key " + s.MaskedKey() + ").";
-            else
-                lblAi.Text = "AI boost: off (local scoring only). Add a key in AI Settings for better picks.";
+            bool hasKey = !string.IsNullOrEmpty(s.ApiKey) && !string.IsNullOrEmpty(s.Provider);
+            lblAi.Text = hasKey
+                ? "AI key: ON (" + s.Provider + " / " + s.Model + ", key " + s.MaskedKey() + ")."
+                : "AI key: not set. Cut using AI needs a key - add one in AI Settings.";
+            if (lblMode != null)
+            {
+                string mode = (rbAiCut != null && rbAiCut.Checked) ? "Cut using AI" : "Full Cut";
+                lblMode.Text = "Mode: " + mode
+                    + ((mode == "Cut using AI" && !hasKey) ? " - no key set yet, add it in AI Settings or use Full Cut." : ".");
+            }
+        }
+
+        private void Mode_CheckedChanged(object sender, EventArgs e)
+        {
+            RefreshAiLabel();
         }
 
         private void AddLabel(string text, int top)
@@ -808,77 +1081,6 @@ namespace ViralClips
             return null;
         }
 
-        // Optional AI boost: send the transcript to the user's own key.
-        // Returns extra scores by clip start second, or null on any failure.
-        private Dictionary<int, int> AiBoostScores(List<VttCue> allCues, double duration)
-        {
-            AiSettings s = AiSettings.Load();
-            if (string.IsNullOrEmpty(s.ApiKey) || string.IsNullOrEmpty(s.Provider)) return null;
-            try
-            {
-                var sb = new StringBuilder();
-                foreach (VttCue c in allCues)
-                {
-                    if (sb.Length > 12000) break;
-                    sb.Append("[").Append(ViralScorer.FormatTime(c.Start).Substring(0, 8)).Append("] ").Append(c.Text).Append(" ");
-                }
-                string transcript = sb.ToString();
-                if (transcript.Length < 20) return null;
-                string prompt = "You are a short-video editor. From this video transcript with timestamps, "
-                    + "pick the moments most likely to hold a stranger's attention in the first 2 seconds. "
-                    + "Reply with ONLY a JSON array like [{\"start\": 12, \"score\": 90, \"title\": \"...\"}]. "
-                    + "Use start times in whole seconds. Pick at most 10. Transcript: " + transcript;
-                string url, body;
-                if (s.Provider == "gemini")
-                {
-                    string model = string.IsNullOrEmpty(s.Model) ? "gemini-2.5-flash" : s.Model;
-                    url = "https://generativelanguage.googleapis.com/v1beta/models/" + Uri.EscapeDataString(model)
-                        + ":generateContent?key=" + Uri.EscapeDataString(s.ApiKey);
-                    body = "{\"contents\":[{\"parts\":[{\"text\":\"" + ViralScorer.EscapeJson(prompt) + "\"}]}]}";
-                }
-                else
-                {
-                    string model = string.IsNullOrEmpty(s.Model) ? "gpt-4o-mini" : s.Model;
-                    string baseUrl = s.Provider == "groq" ? "https://api.groq.com/openai/v1/chat/completions"
-                        : "https://api.openai.com/v1/chat/completions";
-                    url = baseUrl;
-                    body = "{\"model\":\"" + ViralScorer.EscapeJson(model) + "\",\"messages\":["
-                        + "{\"role\":\"user\",\"content\":\"" + ViralScorer.EscapeJson(prompt) + "\"}]}";
-                }
-                var req = (HttpWebRequest)WebRequest.Create(url);
-                req.Method = "POST";
-                req.ContentType = "application/json";
-                req.Timeout = 60000;
-                if (s.Provider != "gemini")
-                    req.Headers["Authorization"] = "Bearer " + s.ApiKey;
-                byte[] bytes = new UTF8Encoding(false).GetBytes(body);
-                req.ContentLength = bytes.Length;
-                using (Stream st = req.GetRequestStream()) { st.Write(bytes, 0, bytes.Length); }
-                string resp;
-                using (var r = (HttpWebResponse)req.GetResponse())
-                using (var sr = new StreamReader(r.GetResponseStream()))
-                { resp = sr.ReadToEnd(); }
-                var scores = new Dictionary<int, int>();
-                foreach (Match m in Regex.Matches(resp, "\"start\"\\s*:\\s*(\\d+)"))
-                {
-                    int start = int.Parse(m.Groups[1].Value);
-                    // score is the next "score" number after this start in the text
-                    int pos = m.Index;
-                    Match sm = Regex.Match(resp.Substring(pos, Math.Min(200, resp.Length - pos)), "\"score\"\\s*:\\s*(\\d+)");
-                    int sc = sm.Success ? int.Parse(sm.Groups[1].Value) : 80;
-                    if (!scores.ContainsKey(start)) scores[start] = Math.Max(0, Math.Min(100, sc));
-                }
-                if (scores.Count == 0) return null;
-                aiNote = "AI boost used (" + s.Provider + ").";
-                return scores;
-            }
-            catch (Exception ex)
-            {
-                aiNote = "AI boost failed (" + ex.Message + ") - local scoring used.";
-                return null;
-            }
-        }
-
         private void BtnAnalyse_Click(object sender, EventArgs e)
         {
             if (!File.Exists(FfmpegPath) || !File.Exists(FfprobePath))
@@ -900,6 +1102,24 @@ namespace ViralClips
                 MessageBox.Show("yt-dlp.exe was not found next to ViralClips.exe.\n\nFor links, keep yt-dlp.exe in the same folder. (Picking a local file does not need it.)",
                     "Missing file", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
+            }
+            cutMode = (rbAiCut != null && rbAiCut.Checked) ? 1 : 0;
+            if (cutMode == 1)
+            {
+                AiSettings s0 = AiSettings.Load();
+                if (string.IsNullOrEmpty(s0.ApiKey) || string.IsNullOrEmpty(s0.Provider))
+                {
+                    DialogResult dr = MessageBox.Show(
+                        "Cut using AI needs your own AI key (Gemini, OpenAI or Groq).\n\nAdd it in AI Settings, or press Yes to fall back to Full Cut (local scoring, no key needed).",
+                        "AI key needed", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+                    if (dr == DialogResult.Yes)
+                    {
+                        cutMode = 0;
+                        rbFullCut.Checked = true;
+                        RefreshAiLabel();
+                    }
+                    else return;
+                }
             }
             phase = "analyse";
             cancelRequested = false;
@@ -1065,27 +1285,32 @@ namespace ViralClips
             }
             bg.ReportProgress(70, "Scoring moments...");
             double clipLen = ClipLengthSeconds();
-            List<Clip> ranked = ViralScorer.ScoreWindows(totalSeconds, clipLen, speechSpans, cues);
-            Dictionary<int, int> ai = null;
-            if (cues.Count > 0)
-            {
-                bg.ReportProgress(80, "AI boost check...");
-                ai = AiBoostScores(cues, totalSeconds);
-            }
-            if (ai != null)
-            {
-                foreach (Clip c in ranked)
-                {
-                    int key = (int)Math.Round(c.Start);
-                    int aiScore;
-                    if (ai.TryGetValue(key, out aiScore))
-                        c.Score = (c.Score + aiScore) / 2;
-                }
-                ranked.Sort(delegate(Clip a, Clip b) { return b.Score.CompareTo(a.Score); });
-            }
             int want = 3;
             try { want = (int)numClipCount.Value; } catch { }
-            foundClips = ViralScorer.PickTop(ranked, want);
+            if (cutMode == 1)
+            {
+                bg.ReportProgress(78, "Asking the AI brain...");
+                List<Clip> aiClips;
+                string aiErr;
+                if (AiBrain.CallAi(cues, speechSpans, totalSeconds, clipLen, want, out aiClips, out aiErr)
+                    && aiClips != null && aiClips.Count > 0)
+                {
+                    foundClips = aiClips;
+                    aiNote = "Cut using AI: " + aiClips.Count + " moment(s) picked by the AI brain.";
+                }
+                else
+                {
+                    aiNote = "AI brain: " + aiErr + " - fell back to Full Cut local scoring.";
+                    List<Clip> ranked = ViralScorer.ScoreWindows(totalSeconds, clipLen, speechSpans, cues);
+                    foundClips = ViralScorer.PickTop(ranked, want);
+                }
+            }
+            else
+            {
+                List<Clip> ranked = ViralScorer.ScoreWindows(totalSeconds, clipLen, speechSpans, cues);
+                foundClips = ViralScorer.PickTop(ranked, want);
+                aiNote = "Full Cut: local scoring only, no AI key used.";
+            }
             bg.ReportProgress(100, "Done.");
         }
 
@@ -1266,7 +1491,7 @@ namespace ViralClips
             Controls.Add(txtKey); y += 42;
 
             var lblNote = new Label();
-            lblNote.Text = "No key = the app still works fully with local scoring.\nWith a key, the transcript is sent to that provider only.";
+            lblNote.Text = "Cut using AI uses this key. No key = Full Cut still works fully with local scoring.\nWith a key, the transcript + loudness data is sent to that provider only.";
             lblNote.ForeColor = Color.DimGray;
             lblNote.Location = new Point(x, y); lblNote.Size = new Size(420, 36);
             Controls.Add(lblNote); y += 48;
