@@ -8,8 +8,8 @@
    the result endpoint until the ranked moments come back, then cuts the
    clips with ffmpeg.wasm exactly as Full Cut does.
    Other network calls: ffmpeg.wasm + a font from public CDNs when
-   cutting clips, and an optional public download service when the user
-   pastes a link.
+   cutting clips, and our own server (apiurl.online) when the user
+   pastes a link — it resolves the link to a direct video URL.
    No clip is guaranteed to go viral: the score only ranks moments most
    likely to hold a stranger's attention. */
 
@@ -21,6 +21,7 @@
 const MUSE_API_BASE = "https://apiurl.online/viralclips/api";
 const MUSE_ANALYSE_URL = MUSE_API_BASE + "/analyse.php";
 const MUSE_RESULT_URL = MUSE_API_BASE + "/result.php";
+const MUSE_DOWNLOAD_URL = MUSE_API_BASE + "/download.php";
 
 /* ---------- helpers ---------- */
 const $ = (id) => document.getElementById(id);
@@ -439,40 +440,63 @@ function validateMoments(arr, count, clipLen) {
   return picked;
 }
 
-/* ---------- link download (honest: static page cannot do this alone) ---------- */
+/* ---------- link download (via our own server) ---------- */
+/* The public download service this page used to call now needs an API
+   key, and YouTube is disabled on its main instance — so links go
+   through our own server instead: POST the link to download.php, poll
+   result.php until the worker resolves a direct video URL, then fetch
+   that URL from this browser (the user's own connection) and load it
+   exactly as an uploaded file. No video bytes pass through our server.
+   If any step fails, the honest message below says so and points at
+   the file-upload path, which always works. */
 async function tryLinkDownload(url) {
   const trimmed = (url || "").trim();
   if (!trimmed) { setStatus("Paste a YouTube or TikTok link first.", "error"); return; }
-  setStatus("Trying the public download service for that link…");
-  const endpoints = ["https://co.api.dev/api/json", "https://api.cobalt.tools/api/json"];
-  let directUrl = null;
-  for (const ep of endpoints) {
-    try {
-      const res = await fetch(ep, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json" },
-        body: JSON.stringify({ url: trimmed }),
-      });
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (data && data.url) { directUrl = data.url; break; }
-    } catch (e) { /* try next endpoint, then fall through to the honest message */ }
-  }
-  if (!directUrl) {
-    setStatus("Link download did not work here: a static page cannot download YouTube/TikTok directly, and the public download service did not return a file. Download the video yourself and upload the file below — that path works fully in your browser.", "error");
+  let dlUrl = null, dlTitle = "", dlDur = 0;
+  try {
+    setStatus("Asking our server to fetch that link…");
+    const res = await fetch(MUSE_DOWNLOAD_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: "dl-" + newRequestId(), url: trimmed }),
+    });
+    if (!res.ok) throw new Error("download endpoint " + res.status);
+    const data = await res.json();
+    if (!data || data.ok !== true || !data.id) throw new Error("bad download reply");
+    // Poll result.php up to 3 minutes for the resolved direct URL.
+    const started = Date.now();
+    for (;;) {
+      if (Date.now() - started > 180000) throw new Error("download timed out");
+      await new Promise((r) => setTimeout(r, 5000));
+      let rr;
+      try {
+        rr = await fetch(MUSE_RESULT_URL + "?id=" + encodeURIComponent(data.id));
+      } catch (e) { throw new Error("download server unreachable"); }
+      if (!rr.ok) throw new Error("download server error");
+      const dj = await rr.json();
+      if (dj && dj.status === "done" && dj.url) {
+        dlUrl = dj.url; dlTitle = dj.title || ""; dlDur = dj.duration || 0;
+        break;
+      }
+      if (dj && dj.status === "error") throw new Error(String(dj.error || "download failed"));
+      setStatus("Our server is fetching your video… (this usually takes under a minute)");
+    }
+  } catch (e) {
+    setStatus("Link download did not work here: " + (e && e.message ? e.message : "our server could not fetch that link") + ". The video may be private, age-restricted, or longer than 30 minutes. Download the video yourself and upload the file below — that path works fully in your browser.", "error");
     return;
   }
   try {
-    const res = await fetch(directUrl);
+    setStatus("Link ready" + (dlTitle ? " — " + dlTitle : "") + " — downloading the video file into your browser…");
+    const res = await fetch(dlUrl);
     if (!res.ok) throw new Error("HTTP " + res.status);
     const blob = await res.blob();
     if (!blob || blob.size < 10000) throw new Error("empty file");
-    const name = "downloaded-video.mp4";
-    const file = new File([blob], name, { type: blob.type || "video/mp4" });
-    setStatus("Link downloaded (" + (blob.size / 1048576).toFixed(1) + " MB). Now press Analyse video.", "ok");
+    const base = (dlTitle || "downloaded-video").replace(/[^\w\- ]+/g, "").trim().slice(0, 60) || "downloaded-video";
+    const file = new File([blob], base + ".mp4", { type: blob.type || "video/mp4" });
+    setStatus("Link downloaded (" + (blob.size / 1048576).toFixed(1) + " MB" + (dlDur ? ", " + fmtTime(dlDur) : "") + "). Now press Analyse video.", "ok");
     loadVideoFile(file);
   } catch (e) {
-    setStatus("The download service gave a link, but this browser could not fetch the file from it (blocked by the video host). Download the video yourself and upload the file below — that path works fully in your browser.", "error");
+    setStatus("Our server found the video, but this browser could not fetch the file from the video host (blocked by the video host). Download the video yourself and upload the file below — that path works fully in your browser.", "error");
   }
 }
 $("try-link").addEventListener("click", () => tryLinkDownload($("link-input").value));
