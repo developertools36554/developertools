@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ViralClips — Turn long videos into vertical clips, in your browser</title>
-<meta name="description" content="ViralClips: paste a link or upload a video file and cut it into 9:16 vertical clips, ready to post. Runs entirely in your browser — nothing is uploaded to any server.">
+<meta name="description" content="ViralClips: paste a link or upload a video file and cut it into 9:16 vertical clips, ready to post. Full Cut runs entirely in your browser. Cut using AI sends only analysis data to our server — no video, no key needed.">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <header class="hero">
   <h1>ViralClips</h1>
   <p class="tagline">Turn long videos into captioned vertical clips, ready to post.</p>
-  <p class="privacy-badge">100% in your browser — your video is never uploaded to any server.</p>
+  <p class="privacy-badge">Full Cut runs 100% in your browser. Cut using AI sends only analysis data — your video file is never uploaded.</p>
   <p class="honest-note">No score can guarantee a clip will go viral. ViralClips only ranks the moments most likely to hold a stranger's attention.</p>
 </header>
 
@@ -30,35 +30,9 @@
       <label class="mode-card">
         <input type="radio" name="mode" value="ai">
         <span class="mode-title">Cut using AI</span>
-        <span class="mode-desc">The AI brain re-ranks the moments. Needs your own Gemini, OpenAI or Groq key (stored only in your browser).</span>
+        <span class="mode-desc">Muse analyses your video's moments on our server and re-ranks them. No key needed — just analyse.</span>
       </label>
     </div>
-  </section>
-
-  <!-- ============ AI SETTINGS ============ -->
-  <section class="card" id="ai-settings" aria-labelledby="ai-heading">
-    <h2 id="ai-heading">AI settings <span class="muted">(only needed for Cut using AI)</span></h2>
-    <div class="form-row">
-      <label>Provider
-        <select id="ai-provider">
-          <option value="gemini">Gemini</option>
-          <option value="openai">OpenAI</option>
-          <option value="groq">Groq</option>
-        </select>
-      </label>
-      <label>Model
-        <input id="ai-model" type="text" value="gemini-2.0-flash" spellcheck="false">
-      </label>
-    </div>
-    <div class="form-row">
-      <label class="grow">Your API key
-        <input id="ai-key" type="password" placeholder="Paste your own key here" autocomplete="off" spellcheck="false">
-      </label>
-      <button id="save-key" type="button" class="btn secondary">Save key in this browser</button>
-      <button id="clear-key" type="button" class="btn secondary">Clear key</button>
-    </div>
-    <p class="muted small">Your key is stored only in this browser (localStorage). It is sent only to the provider you chose, only when you press Analyse in Cut using AI mode. It is never sent to ViralClips, GitHub or anywhere else. No key is ever built into this page.</p>
-    <p id="key-state" class="small"></p>
   </section>
 
   <!-- ============ VIDEO SOURCE ============ -->
@@ -126,7 +100,7 @@
     <ul>
       <li>Only clip videos you made yourself, or videos you have permission to use. You are responsible for the rights to what you download, clip and post, and for following YouTube / TikTok terms.</li>
       <li>No clip is guaranteed to go viral. The score only ranks moments most likely to hold a stranger's attention.</li>
-      <li>Your video file and your API key never leave your computer except for the AI request you choose to make, which goes only to the AI provider you picked.</li>
+      <li>Your video file never leaves your computer. In Cut using AI mode, only analysis data (timestamps, loudness, transcript) is sent to our own server so Muse can rank the moments — no video bytes, and no key from you is needed.</li>
     </ul>
   </section>
 </main>

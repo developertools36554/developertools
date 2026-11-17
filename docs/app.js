@@ -1,14 +1,26 @@
 /* ViralClips web — fully own code, single-page static app.
-   Everything runs in the user's browser. No video or key is ever sent
-   to any ViralClips server (there is none). The only network calls are:
-   - ffmpeg.wasm + a font, loaded from public CDNs when cutting clips
-   - the AI provider the user chose, only in Cut using AI mode, only with
-     the user's own key
-   - an optional public download service when the user pastes a link
+   Full Cut runs entirely in the user's browser: analysis and cutting
+   happen on the device, and no video is ever uploaded anywhere.
+   Cut using AI needs NO key from the user: the page computes analysis
+   data in the browser (loudness, speech spans, transcript, local
+   moments) and POSTs only that data — never video bytes — to our own
+   server (MUSE_API_BASE below), where Muse analyses it. The page polls
+   the result endpoint until the ranked moments come back, then cuts the
+   clips with ffmpeg.wasm exactly as Full Cut does.
+   Other network calls: ffmpeg.wasm + a font from public CDNs when
+   cutting clips, and an optional public download service when the user
+   pastes a link.
    No clip is guaranteed to go viral: the score only ranks moments most
    likely to hold a stranger's attention. */
 
 "use strict";
+
+/* ---------- our AI server: Muse analyses the request ---------- */
+/* Change this ONE constant if the server moves. The page POSTs analysis
+   data to <base>/analyse.php and polls <base>/result.php?id=... */
+const MUSE_API_BASE = "https://apiurl.online/viralclips/api";
+const MUSE_ANALYSE_URL = MUSE_API_BASE + "/analyse.php";
+const MUSE_RESULT_URL = MUSE_API_BASE + "/result.php";
 
 /* ---------- helpers ---------- */
 const $ = (id) => document.getElementById(id);
@@ -52,59 +64,16 @@ const state = {
   recognition: null,
 };
 
-/* ---------- AI key storage (localStorage only, this browser only) ---------- */
-const KEY_STORE = "viralclips_ai";
-function loadKey() {
-  try {
-    const raw = localStorage.getItem(KEY_STORE);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch (e) { return null; }
-}
-function saveKey() {
-  const data = {
-    provider: $("ai-provider").value,
-    model: $("ai-model").value.trim(),
-    key: $("ai-key").value.trim(),
-  };
-  if (!data.key) { setStatus("Paste your API key first, then save it.", "error"); return; }
-  try { localStorage.setItem(KEY_STORE, JSON.stringify(data)); } catch (e) {}
-  $("key-state").textContent = "Key saved in this browser for " + data.provider + ".";
-  setStatus("Key saved in this browser. It is never sent anywhere except the provider you chose.", "ok");
-}
-function clearKey() {
-  try { localStorage.removeItem(KEY_STORE); } catch (e) {}
-  $("ai-key").value = "";
-  $("key-state").textContent = "Key cleared.";
-  setStatus("Key cleared from this browser.", "ok");
-}
-function refreshKeyState() {
-  const saved = loadKey();
-  if (saved) {
-    $("ai-provider").value = saved.provider || "gemini";
-    $("ai-model").value = saved.model || $("ai-model").value;
-    $("ai-key").value = saved.key || "";
-    $("key-state").textContent = "A key is saved in this browser for " + (saved.provider || "gemini") + ".";
-  }
-}
-$("save-key").addEventListener("click", saveKey);
-$("clear-key").addEventListener("click", clearKey);
-
-/* Provider model defaults */
-const MODEL_DEFAULTS = { gemini: "gemini-2.0-flash", openai: "gpt-4o-mini", groq: "llama-3.3-70b-versatile" };
-$("ai-provider").addEventListener("change", () => {
-  $("ai-model").value = MODEL_DEFAULTS[$("ai-provider").value] || "";
-  const saved = loadKey();
-  if (saved && saved.provider === $("ai-provider").value && saved.model) {
-    $("ai-model").value = saved.model;
-  }
-});
+/* ---------- Cut using AI needs no key from the user ---------- */
+/* Nothing is stored: no provider, no model, no key anywhere on this
+   page. In AI mode the page sends only analysis data to our own server
+   (see requestAiRanking below) and Muse analyses it there. */
 
 /* Mode selector: show AI settings hint when AI mode is picked */
 document.querySelectorAll('input[name="mode"]').forEach((r) => {
   r.addEventListener("change", () => {
     if (document.querySelector('input[name="mode"]:checked').value === "ai") {
-      setStatus("Cut using AI: add your key in AI settings below, then analyse. No key yet? Use Full Cut instead — it works without one.");
+      setStatus("Cut using AI: Muse analyses your video's moments on our server. No key needed — just add a video and press Analyse.");
     } else {
       setStatus("Full Cut: local scoring, no key needed. Add a video and press Analyse.");
     }
@@ -316,85 +285,130 @@ function rankLocalClips(count, clipLen) {
 }
 
 /* ---------- Cut using AI ---------- */
-function aiPrompt(moments, count, clipLen) {
-  const lines = moments.map((m, i) =>
-    (i + 1) + ". " + fmtTime(m.start) + "–" + fmtTime(m.end) +
-    " | local score " + m.score + "/100 | " + m.title
-  ).join("\n");
-  return "You are ranking moments of a video for short vertical clips. " +
-    "Pick the " + count + " moments below most likely to hold a stranger's " +
-    "attention in the first 2 seconds and make them keep watching. " +
-    "Prefer strong hooks, questions, surprising or emotional moments, and " +
-    "clear punchy lines. Reply with JSON ONLY — a JSON array, nothing else — " +
-    "of objects: {\"start\": seconds, \"end\": seconds, \"score\": 0-100, " +
-    "\"title\": \"short hook title\", \"reason\": \"one short sentence\"}. " +
-    "Each clip must be " + clipLen + " seconds or shorter, start inside the video, " +
-    "and clips must not overlap by more than half. Moments:\n" + lines +
-    (state.transcript ? "\nTranscript (may be partial):\n" + state.transcript.slice(0, 4000) : "");
+/* Client-generated request id (also the id the server files the job under). */
+function newRequestId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return "vc-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10);
 }
 
-async function callAI(moments, count, clipLen) {
-  const saved = loadKey();
-  if (!saved || !saved.key) {
-    throw new Error("NO_KEY");
+/* Speech spans from the per-bucket speech flags: [{start, end}, ...]. */
+function speechSpans() {
+  if (!state.speech) return [];
+  const bucketSec = 0.25;
+  const spans = [];
+  let start = null;
+  for (let i = 0; i <= state.speech.length; i++) {
+    const on = i < state.speech.length && state.speech[i];
+    if (on && start === null) start = i * bucketSec;
+    if (!on && start !== null) {
+      spans.push({ start: +start.toFixed(2), end: +(i * bucketSec).toFixed(2) });
+      start = null;
+    }
   }
-  const prompt = aiPrompt(moments, count, clipLen);
-  let url, body, headers = { "Content-Type": "application/json" };
-  if (saved.provider === "gemini") {
-    url = "https://generativelanguage.googleapis.com/v1beta/models/" +
-      encodeURIComponent(saved.model || "gemini-2.0-flash") + ":generateContent?key=" +
-      encodeURIComponent(saved.key);
-    body = { contents: [{ parts: [{ text: prompt }] }] };
-  } else if (saved.provider === "openai") {
-    url = "https://api.openai.com/v1/chat/completions";
-    headers.Authorization = "Bearer " + saved.key;
-    body = {
-      model: saved.model || "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.4,
-    };
-  } else { // groq, OpenAI-compatible
-    url = "https://api.groq.com/openai/v1/chat/completions";
-    headers.Authorization = "Bearer " + saved.key;
-    body = {
-      model: saved.model || "llama-3.3-70b-versatile",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.4,
-    };
-  }
-  const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
-  if (!res.ok) {
-    throw new Error("AI request failed (HTTP " + res.status + "). Check the key, the model name, and the provider.");
-  }
-  const data = await res.json();
-  let text = "";
-  if (saved.provider === "gemini") {
-    text = (data.candidates && data.candidates[0] && data.candidates[0].content &&
-      data.candidates[0].content.parts && data.candidates[0].content.parts[0] &&
-      data.candidates[0].content.parts[0].text) || "";
-  } else {
-    text = (data.choices && data.choices[0] && data.choices[0].message &&
-      data.choices[0].message.content) || "";
-  }
-  return parseAiClips(text, count, clipLen);
+  return spans;
 }
 
-function parseAiClips(text, count, clipLen) {
-  if (!text) throw new Error("The AI returned an empty reply.");
-  // Find the first JSON array in the reply (models often add fences / prose).
-  const start = text.indexOf("[");
-  const end = text.lastIndexOf("]");
-  if (start === -1 || end === -1 || end <= start) {
-    throw new Error("The AI reply was not JSON. Falling back to local scoring.");
+/* Loudness buckets, rounded and downsampled so the POST stays small.
+   Never includes any video bytes — only numbers 0..1 per 0.25s bucket. */
+function packedBuckets() {
+  if (!state.buckets) return [];
+  const max = 4000;
+  const src = state.buckets;
+  if (src.length <= max) return src.map((b) => +b.toFixed(3));
+  const out = [];
+  const step = src.length / max;
+  for (let i = 0; i < max; i++) {
+    const a = Math.floor(i * step), b = Math.min(src.length, Math.floor((i + 1) * step));
+    let sum = 0;
+    for (let j = a; j < b; j++) sum += src[j];
+    out.push(+((sum / Math.max(1, b - a)).toFixed(3)));
   }
-  let arr;
-  try { arr = JSON.parse(text.slice(start, end + 1)); }
-  catch (e) { throw new Error("The AI reply could not be read as JSON. Falling back to local scoring."); }
-  if (!Array.isArray(arr)) throw new Error("The AI reply was not a list. Falling back to local scoring.");
+  return out;
+}
+
+/* The POST body for the AI server. Analysis data ONLY: no video bytes,
+   no key of any kind. The server analyses this and returns ranked moments. */
+function buildAiPayload(localTop, count, clipLen) {
+  return {
+    id: newRequestId(),
+    mode: "ai",
+    duration: +state.duration.toFixed(2),
+    file_name: state.fileName,
+    speech_spans: speechSpans(),
+    loudness_buckets: packedBuckets(),
+    bucket_sec: 0.25,
+    transcript: (state.transcript || "").slice(0, 20000),
+    clip_count: count,
+    clip_len: clipLen,
+    local_moments: localTop.map((m) => ({
+      start: +m.start.toFixed(2), end: +m.end.toFixed(2),
+      score: m.score, title: m.title, reason: m.reason || "",
+    })),
+  };
+}
+
+/* Poll the result endpoint every 10s until the ranked moments arrive.
+   Throws SERVER_NOT_LIVE (unreachable / bad HTTP), TIMEOUT (5 min), or
+   the server's own error message. Never invents a result. */
+async function pollAiResult(id, count, clipLen) {
+  const started = Date.now();
+  const maxWaitMs = 5 * 60 * 1000;
+  let waits = 0;
+  for (;;) {
+    let res;
+    try {
+      res = await fetch(MUSE_RESULT_URL + "?id=" + encodeURIComponent(id), { method: "GET" });
+    } catch (e) {
+      throw new Error("SERVER_NOT_LIVE");
+    }
+    if (!res.ok) throw new Error("SERVER_NOT_LIVE");
+    let data = null;
+    try { data = await res.json(); } catch (e) { throw new Error("SERVER_NOT_LIVE"); }
+    if (data && data.status === "done") {
+      return validateMoments(data.moments, count, clipLen);
+    }
+    if (data && data.status === "error") {
+      throw new Error(String(data.error || "The server reported an error while analysing."));
+    }
+    // status "queued" (or unknown): keep waiting, but not forever.
+    waits++;
+    if (Date.now() - started > maxWaitMs) throw new Error("TIMEOUT");
+    setStatus("Muse is analysing your video… (" + (waits * 10) + "s)");
+    await new Promise((r) => setTimeout(r, 10000));
+  }
+}
+
+/* Cut using AI, no key from the user: POST analysis data to our server,
+   then poll until Muse returns the ranked moments. */
+async function requestAiRanking(localTop, count, clipLen) {
+  const payload = buildAiPayload(localTop, count, clipLen);
+  let res;
+  try {
+    res = await fetch(MUSE_ANALYSE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    throw new Error("SERVER_NOT_LIVE");
+  }
+  if (!res.ok) throw new Error("SERVER_NOT_LIVE");
+  let data = null;
+  try { data = await res.json(); } catch (e) { throw new Error("SERVER_NOT_LIVE"); }
+  if (!data || data.ok !== true || !data.id) throw new Error("SERVER_NOT_LIVE");
+  return pollAiResult(data.id, count, clipLen);
+}
+
+function validateMoments(arr, count, clipLen) {
+  if (!Array.isArray(arr) || arr.length === 0) {
+    throw new Error("The server returned no ranked moments. Falling back to local scoring.");
+  }
   const out = [];
   for (const item of arr) {
     if (!item || typeof item !== "object") continue;
-    let s = Number(item.start), e2 = Number(item.end);
+    // Server contract: start_sec / end_sec. Tolerate start / end too.
+    let s = Number(item.start_sec != null ? item.start_sec : item.start);
+    let e2 = Number(item.end_sec != null ? item.end_sec : item.end);
     if (!isFinite(s) || !isFinite(e2)) continue;
     s = clamp(s, 0, Math.max(0, state.duration - 5));
     e2 = clamp(e2, s + 5, Math.min(state.duration, s + clipLen));
@@ -403,9 +417,12 @@ function parseAiClips(text, count, clipLen) {
       start: s, end: e2,
       score: clamp(Math.round(Number(item.score) || 50), 0, 100),
       title: String(item.title || hookTitleFor(s)).slice(0, 80),
-      reason: String(item.reason || "Picked by the AI brain."),
+      reason: String(item.reason || "Ranked by Muse."),
       source: "ai",
     });
+  }
+  if (!out.length) {
+    throw new Error("The server returned no usable moments. Falling back to local scoring.");
   }
   // De-overlap, same rule as local ranking.
   const picked = [];
@@ -509,15 +526,10 @@ $("analyse").addEventListener("click", async () => {
   await analyseAudio();
   const mode = currentMode();
   if (mode === "ai") {
-    const saved = loadKey();
-    if (!saved || !saved.key) {
-      setStatus("Cut using AI needs your API key — add it in AI settings above. Or switch to Full Cut, which works without a key.", "error");
-      return;
-    }
-    setStatus("Local moments found. Asking the AI brain to re-rank them…");
+    setStatus("Local moments found. Sending analysis data to Muse…");
     const localTop = rankLocalClips(Math.min(12, count * 4), clipLen);
     try {
-      const aiClips = await callAI(localTop, count, clipLen);
+      const aiClips = await requestAiRanking(localTop, count, clipLen);
       let clips = aiClips;
       if (clips.length < count) {
         // Top up with local picks so the user still gets the clips they asked for.
@@ -529,16 +541,18 @@ $("analyse").addEventListener("click", async () => {
       }
       state.clips = clips;
       renderClips();
-      setStatus("AI ranking done — " + clips.length + " clip" + (clips.length === 1 ? "" : "s") + " ranked. Tick the ones you want, then press Make clips.", "ok");
+      setStatus("Muse ranking done — " + clips.length + " clip" + (clips.length === 1 ? "" : "s") + " ranked. Tick the ones you want, then press Make clips.", "ok");
     } catch (e) {
-      if (e && e.message === "NO_KEY") {
-        setStatus("Cut using AI needs your API key — add it in AI settings above.", "error");
-        return;
-      }
-      // Honest fallback: AI failed, local scoring still gives clips.
+      // Honest fallback: AI server unavailable, local scoring still gives clips.
       state.clips = rankLocalClips(count, clipLen);
       renderClips();
-      setStatus("AI call failed (" + (e && e.message ? e.message : "unknown error") + ") — fell back to Full Cut local scoring. Your clips are ranked below.", "error");
+      if (e && e.message === "SERVER_NOT_LIVE") {
+        setStatus("AI analysis server is not live yet — use Full Cut for now, it works fully in your browser. Your clips below are ranked by Full Cut local scoring.", "error");
+      } else if (e && e.message === "TIMEOUT") {
+        setStatus("Muse is taking too long to answer — fell back to Full Cut local scoring. Your clips are ranked below. Try Cut using AI again in a little while.", "error");
+      } else {
+        setStatus("Muse analysis failed (" + (e && e.message ? e.message : "unknown error") + ") — fell back to Full Cut local scoring. Your clips are ranked below.", "error");
+      }
     }
   } else {
     state.clips = rankLocalClips(count, clipLen);
@@ -717,4 +731,4 @@ $("make-clips").addEventListener("click", async () => {
 });
 
 /* ---------- init ---------- */
-refreshKeyState();
+/* Nothing to restore: no key is stored anywhere. */

@@ -13,13 +13,19 @@ clips in your browser. Fully own code.
   loudness 10 + hook words 10 + keyword hits 10 + clean start 5 + early
   position 5 = 100). Top moments are picked so they do not overlap by more
   than half. No key needed.
-- **Cut using AI mode**: the page sends the ranked moment list (timestamps,
-  local scores, hook titles, and your pasted transcript if any) to the AI
-  provider you chose — Gemini, OpenAI or Groq — using YOUR OWN key, and the
-  AI re-ranks the moments. The key is stored only in your browser
-  (localStorage) and is sent only to that provider. If there is no key, the
-  page says so plainly and offers Full Cut instead. If the AI call fails,
-  it falls back to local scoring and says so.
+- **Cut using AI mode — no key needed from you**: the page computes
+  analysis data in your browser (loudness buckets, speech spans, your
+  pasted transcript if any, and the local ranked moments) and POSTs
+  only that data — never any video bytes — to our own server
+  (`https://apiurl.online/viralclips/api/analyse.php`, one constant
+  at the top of `app.js`). Muse analyses the request there. The page
+  then polls `result.php?id=...` every 10 seconds and shows "Muse is
+  analysing your video..." until the ranked moments come back, and
+  cuts them exactly like Full Cut. If the server is not live yet, the
+  page says so plainly ("AI analysis server is not live yet — use
+  Full Cut for now") and falls back to Full Cut local scoring. If
+  Muse's analysis fails or takes too long (5 minutes), it also falls
+  back to Full Cut and says so. Nothing is ever faked.
 - **Cutting to 9:16 vertical (720x1280)** in the browser with ffmpeg.wasm
   (loaded from the unpkg CDN when you press Make clips). Hook titles are
   burned in for the first 2.5 seconds; transcript captions are burned in
@@ -53,17 +59,22 @@ clips in your browser. Fully own code.
 - No score can guarantee a clip will go viral. The score only ranks the
   moments most likely to hold a stranger's attention.
 - Only clip videos you made yourself, or videos you have permission to use.
-- AI mode costs whatever your own AI provider charges for your key; the
-  page itself charges nothing and sends nothing anywhere else.
+- Cut using AI sends only analysis data to our server (see the AI bullet
+  above). Your video file never leaves your computer, and you need no
+  key of any kind. Full Cut sends nothing anywhere.
 
 ## Files
 
 - `index.html` — the whole page (landing + app)
-- `app.js` — all logic: audio analysis, scoring, AI calls, link attempt, ffmpeg.wasm cutting
+- `app.js` — all logic: audio analysis, scoring, AI server POST + polling, link attempt, ffmpeg.wasm cutting
 - `style.css` — styling
 - `README-WEB.md` — this file
+- `../server/` — the AI backend (local files only, not deployed yet):
+  `analyse.php` (queues requests), `result.php` (returns results),
+  `README-SERVER.md` (queue format + the worker contract for Muse)
 
-No build step. No server. No dependencies to install.
+No build step. Full Cut needs no server at all; Cut using AI uses our
+own server (see `../server/`). No dependencies to install.
 
 ## Enable GitHub Pages
 
@@ -79,8 +90,13 @@ No build step. No server. No dependencies to install.
 - `node --check app.js` — syntax valid.
 - HTML checked with Python's html.parser — parses cleanly, all element
   IDs referenced in `app.js` exist in `index.html` (checked by script).
-- ffmpeg.wasm cutting and the AI calls were NOT tested end-to-end here:
-  they need a real browser with network access to the CDN and to an AI
-  provider. Still to prove in a real browser: load the page, upload a
-  short video, analyse in both modes, press Make clips, download a clip
-  and check it is 720x1280 with the right duration.
+- ffmpeg.wasm cutting was NOT tested end-to-end here: it needs a real
+  browser with network access to the CDN. The AI server flow was also
+  NOT tested end-to-end: the backend is not deployed yet, so the page
+  will show the honest "server is not live yet" message and fall back
+  to Full Cut. Still to prove: deploy `server/` to apiurl.online and
+  run the worker, then in a real browser load the page, upload a short
+  video, analyse in Cut using AI mode, watch the poll return ranked
+  moments, press Make clips, download a clip and check it is 720x1280
+  with the right duration. Full Cut in a real browser is still to be
+  proved the same way.
