@@ -1,0 +1,10 @@
+# ViralClips repo ignores
+out/
+pkg/
+test/
+*.settings.txt
+*.zip
+*.part
+*.mp4
+*.srt
+*.vtt
