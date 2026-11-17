@@ -37,12 +37,18 @@ clips in your browser. Fully own code.
 
 - **YouTube / TikTok link download.** A static GitHub Pages site cannot
   download YouTube or TikTok videos directly — the browser blocks it
-  (CORS / no server to fetch from). The page tries a public download
-  service (Cobalt public API) first. If that returns a file the browser
-  can fetch, the file goes into the same pipeline. If it fails, the page
-  shows an honest message: download the video yourself and upload the
-  file instead — that path works fully in the browser. Nothing is faked:
-  if the link cannot be fetched, the page says so.
+  (CORS / no server to fetch from). So the page sends the link to our
+  own server (`POST apiurl.online/viralclips/api/download.php`), where
+  the worker resolves it to a direct video URL with yt-dlp (YouTube
+  and TikTok both work; videos up to 30 minutes). The page then fetches
+  that direct URL itself, from the user's own connection, and the file
+  goes into the same pipeline. If any step fails, the page shows an
+  honest message: download the video yourself and upload the file
+  instead — that path works fully in your browser. Nothing is faked:
+  if the link cannot be fetched, the page says so. (The public
+  download service the page used to call now needs an API key, and
+  YouTube is disabled on its main instance — that is why the server
+  path exists.)
 - **Automatic transcription.** The Web Speech API listens through the
   microphone, not through a video file, so a static page cannot reliably
   transcribe a file by itself. The page offers an experimental
